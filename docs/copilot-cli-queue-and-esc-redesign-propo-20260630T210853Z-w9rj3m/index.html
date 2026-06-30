@@ -1,0 +1,343 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Copilot CLI Queue and Esc Redesign Proposal</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/github-markdown-css@5/github-markdown.min.css">
+<style>
+  body { margin: 0; padding: 2rem 1rem; display: flex; justify-content: center;
+         background: var(--bgColor-default, #fff); }
+  .markdown-body { box-sizing: border-box; min-width: 200px; max-width: 980px;
+                   width: 100%; padding: 2rem; }
+  @media (max-width: 767px) { .markdown-body { padding: 1rem; } }
+</style>
+</head>
+<body>
+<article class="markdown-body">
+<h1>Copilot CLI: queue + escape unified redesign</h1>
+<p><strong>Status</strong>: external design proposal — derived from the research in <code class="notranslate">queue-esc-report.md</code>.<br>
+<strong>Audience</strong>: copilot-cli maintainers (for discussion if shared).</p>
+<blockquote>
+<p><strong>Framing</strong>: This is a proposal from an external user, not a team commitment to ship. It identifies real correctness and discoverability bugs and proposes a coherent fix surface. The unified-list direction in §3.1 is a recommendation with rationale — the team may have shipping reasons to keep the existing two-storage model that aren't visible from outside, and most of the individual fixes (§3.2 Esc-Esc, §3.3 Up-arrow edit, §3.4 wiring <code class="notranslate">/queue</code>, §3.5 status bar, §3.8 inline hints) are valuable independently and work under either model.</p>
+</blockquote>
+<hr>
+<h2>1. Problem statement</h2>
+<p>The current pending-vs-queued model is good underneath but unusable on top.</p>
+<p>Confirmed in the source (<code class="notranslate">queue-esc-report.md §3a</code>) and live testing on v1.0.65:</p>
+<ul>
+<li><strong>Pending</strong> (Enter) batches into one prompt that flushes when the current turn ends.</li>
+<li><strong>Queued</strong> (Ctrl+Q) sends each item as its own separate turn after pending drains.</li>
+<li><strong>Slash commands during a working agent always land in queued, never pending</strong> — confirmed via test on v1.0.65: submit a story request, then <code class="notranslate">/compact</code>, then another story request while the agent works → both stories land in pending, <code class="notranslate">/compact</code> lands in queued, and the stories run BEFORE <code class="notranslate">/compact</code> despite being interleaved temporally.</li>
+</ul>
+<p>The hidden third mode (slash-command-forced-queued) plus the all-pending-first-then-all-queued ordering creates a real correctness bug: <code class="notranslate">/compact</code> between two messages no longer means "compact between them" — it means "compact after both", which defeats the user's intent.</p>
+<p>These are two underlying mechanisms that do useful work — bundling consecutive text messages and giving slash commands their own dispatch — but the UX exposes them as two separate "storage areas" instead of as bundle-vs-split flags on a single ordered list.</p>
+<ol>
+<li><strong>Esc-Esc destroys pending instead of stopping the agent.</strong> The user usually wants the agent to stop so the new message can go through; current behavior cancels the message and lets the agent keep running.</li>
+<li><strong>Pending isn't editable.</strong> Up-arrow recalls history, not pending. Users assume their typed messages are still editable; they aren't.</li>
+<li><strong>No queue management.</strong> <code class="notranslate">/queue</code> does nothing. The only way to alter queued items is Esc-Esc (which destroys them LIFO rather than letting the user pick).</li>
+<li><strong>Hint bar lies across terminals.</strong> Shows <code class="notranslate">ctrl+enter enqueue</code> based on terminal capability detection, but the actual key varies: works on Kitty-native terminals, falls through to Enter on Termius, gets hijacked by the OS on macOS Terminal.app.</li>
+<li><strong><code class="notranslate">/queue</code> is a registered slash command that does nothing</strong> — pure dead code from the user's perspective.</li>
+<li><strong>Temporal order is violated when slash commands interleave with messages.</strong> Confirmed bug, breaks <code class="notranslate">/compact</code> semantics specifically.</li>
+</ol>
+<h2>2. Design principles</h2>
+<ol>
+<li><strong>Each key has one intent.</strong> Esc, Ctrl+C, <code class="notranslate">/queue</code>, and Up arrow each mean one thing and don't overlap.</li>
+<li><strong>The user's work is sacred.</strong> Typed input is never destroyed silently. Cancellation is the user's explicit choice.</li>
+<li><strong>Cross-terminal honesty.</strong> The status bar shows keys that actually work on this terminal — no advertising hijacked or no-op keys.</li>
+<li><strong>Discoverability.</strong> Both modes (pending and queued) and their separate semantics are surfaced in <code class="notranslate">/help</code>, in the status bar, AND inline in the input box (placeholder hints + mode headers when browsing).</li>
+</ol>
+<h2>3. Proposed behavior</h2>
+<h3>3.1 Recommended: route slash commands into pending, preserve temporal order</h3>
+<p><strong>Scoped recommendation — preserves both existing surfaces (<code class="notranslate">[pending]</code> inline and <code class="notranslate">Queued (N)</code> block) and changes only the routing rule for slash commands.</strong> The current implementation auto-routes slash commands to the queued stack regardless of the user's intent; this causes the temporal-order bug confirmed in §1. The fix is to let slash commands sit in pending alongside text messages, with bundling logic that splits at slash-command boundaries.</p>
+<p>The recommended model:</p>
+<markdown-accessiblity-table><table role="table">
+<thead>
+<tr>
+<th>Submission</th>
+<th>Lands in</th>
+<th>Flush behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Plain text + Enter</td>
+<td><strong>Pending</strong></td>
+<td>Merges with adjacent pending text into one LLM prompt at flush time</td>
+</tr>
+<tr>
+<td>Slash command (any submission key)</td>
+<td><strong>Pending</strong> (new — was queued)</td>
+<td>Acts as a split point — runs as its own client operation in temporal order between adjacent text bundles</td>
+</tr>
+<tr>
+<td>Anything + Ctrl+Q</td>
+<td><strong>Queued</strong> (unchanged)</td>
+<td>Each queued item is its own dispatch, sequentially, AFTER pending fully drains</td>
+</tr>
+</tbody>
+</table></markdown-accessiblity-table>
+<p>The "queued" stack now means exactly what its name suggests: items the user explicitly chose to send as separate sequential turns. Slash commands are no longer silently shuffled there.</p>
+<p><strong>Flush rules for pending (the change):</strong></p>
+<ol>
+<li>Walk the pending list in submission order.</li>
+<li>Group consecutive plain-text items into one batched LLM prompt.</li>
+<li>Each slash command is its own client dispatch (inline, in order).</li>
+<li>Dispatch each group/command in order, THEN start draining the queued stack.</li>
+</ol>
+<p><strong>Example:</strong> User submits during a working agent, in this order:</p>
+<ul>
+<li>"tell me a story" (Enter)</li>
+<li>"actually make it about pirates" (Enter)</li>
+<li><code class="notranslate">/compact</code> (Enter — auto-pending under the new rule)</li>
+<li>"now another story" (Enter)</li>
+<li>"fix the typo" (Ctrl+Q)</li>
+</ul>
+<p>When the agent finishes, pending flushes as:</p>
+<ol>
+<li><code class="notranslate">batch("tell me a story" + "actually make it about pirates")</code> → one LLM call</li>
+<li><code class="notranslate">/compact</code> → client operation (in temporal order)</li>
+<li><code class="notranslate">"now another story"</code> → one LLM call (split because /compact broke the bundle)</li>
+</ol>
+<p>Then the queued stack drains:</p>
+<ol start="4">
+<li><code class="notranslate">"fix the typo"</code> → one LLM call</li>
+</ol>
+<p>This fixes the existing bug where <code class="notranslate">/compact</code> runs AFTER all messages even when submitted between them, without removing the queued surface that some users may rely on.</p>
+<p><strong>Why this matches Claude Code's model.</strong> Claude Code has no separate queue concept — slash commands are submitted into the same buffer as text and split the bundle in place. This proposal brings Copilot CLI's pending behavior to parity while preserving the explicit Ctrl+Q "give me separate sequential turns" affordance, which Claude doesn't have.</p>
+<h3>3.2 Escape semantics — three escape hatches, three distinct intents</h3>
+<markdown-accessiblity-table><table role="table">
+<thead>
+<tr>
+<th>Action</th>
+<th>Intent</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Esc-Esc</strong></td>
+<td>"Stop / undo, based on agent state."</td>
+<td>State-aware — see Esc-Esc state matrix below.</td>
+</tr>
+<tr>
+<td><strong>Ctrl+C</strong> (single press)</td>
+<td>"Abandon everything."</td>
+<td>Stop agent + clear pending + clear queued. Existing semantics.</td>
+</tr>
+<tr>
+<td><strong><code class="notranslate">/queue</code></strong></td>
+<td>"Surgical edit of queued items."</td>
+<td>Opens an interactive picker: list / cancel single / cancel all / reorder. Doesn't touch the agent.</td>
+</tr>
+</tbody>
+</table></markdown-accessiblity-table>
+<p>Single Esc still shows the "press twice" hint — keep the current safety pattern.</p>
+<p><strong>Esc-Esc state matrix.</strong> Esc-Esc means different things based on what the agent is doing right now. Each state is mutually exclusive, and the action is the most-likely-desired one for that state:</p>
+<markdown-accessiblity-table><table role="table">
+<thead>
+<tr>
+<th>Agent state</th>
+<th>Esc-Esc effect</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>In pre-flight gap</strong> — user just hit Enter, message dispatched, but agent hasn't started streaming yet</td>
+<td>Pull the in-flight message back into the input field as editable text. Agent never started, so nothing to cancel.</td>
+<td>Closes the current "esc doesn't reliably work right after I hit Enter" complaint cluster. Matches Claude Code.</td>
+</tr>
+<tr>
+<td><strong>Streaming a response</strong></td>
+<td>Stop the agent. Pending (still on canvas) flushes as the next turn. Queued items fire after. Nothing in input or canvas is destroyed.</td>
+<td>This is the original §3.2 behavior.</td>
+</tr>
+<tr>
+<td><strong>Idle, input empty</strong></td>
+<td>Open rewind/checkpoints (existing behavior, leave alone).</td>
+<td>Already works correctly.</td>
+</tr>
+<tr>
+<td><strong>Idle, input non-empty</strong></td>
+<td>Clear the input field (existing behavior, leave alone).</td>
+<td>Already works correctly.</td>
+</tr>
+</tbody>
+</table></markdown-accessiblity-table>
+<p>The pre-flight case is the new fix and resolves the existing "Esc-Esc doesn't reliably work" issues. Currently Esc-Esc in that window does nothing useful because the system thinks "no active turn to cancel" — but the user obviously wants to undo their just-pressed Enter. Pulling the message back as editable text is the natural undo.</p>
+<p><strong>Implementation note</strong>: the pre-flight state is already detected — that's <em>why</em> Esc-Esc currently no-ops in that window (no in-flight turn to cancel, no pending to peel, no input to clear, so the handler falls through). The engineering work is just routing the already-detected state to the new "pull message back" action instead of dropping it on the floor. The state machine doesn't need to learn anything new; it needs to stop discarding what it already knows.</p>
+<p><strong>Why Esc-Esc no longer peels pending LIFO</strong>: the existing behavior solves the wrong problem. When a user has typed a pending message and the agent is still working, the user almost always wants the agent to stop so their new context can land — not to delete their message and let the agent keep going. The current behavior actively destroys the user's typed work. Pending is now edited via Up arrow (§3.3) or canceled by editing → clearing the input.</p>
+<h3>3.3 Editing pending (steal Claude Code's UX)</h3>
+<p>Pending is one ordered list of items waiting to be sent (text + slash commands). Treat it as one editable text buffer:</p>
+<ul>
+<li><strong>Up arrow when pending is non-empty</strong> → loads ALL pending items into the input box as multi-line text in submission order, each on its own line (slash commands keep their <code class="notranslate">/</code> prefix). <strong>The <code class="notranslate">[pending]</code> markers disappear from the canvas at the same moment</strong> — the user now owns those items again, so they're no longer pending.</li>
+<li><strong>Up arrow when pending is empty</strong> → history recall (current behavior, unchanged).</li>
+<li><strong>Enter while editing pending</strong> → re-submits the edited block to pending (replaces whatever pending set was there before). Bundling rules apply at flush time as usual.</li>
+<li><strong>Ctrl+Q while editing pending</strong> → submits the entire edited block as queued items (one per line) instead. Useful when the user changes their mind and wants the whole thing to run as separate turns.</li>
+<li><strong>Clearing the input field</strong> (Ctrl+U, Backspace-all, or just deleting the text) → cancels all the (formerly) pending items. No separate "cancel" command needed.</li>
+<li><strong>Esc while editing pending</strong> → discards the edit and restores the original pending set to the canvas.</li>
+</ul>
+<p>Queued items are NOT pulled into pending by Up arrow — they're managed separately via <code class="notranslate">/queue</code> (§3.4). Pending and queued remain two distinct UI surfaces; Up just edits pending.</p>
+<p>The disambiguation is unambiguous because pending only exists while the agent is busy, and Up's two behaviors trigger in mutually exclusive states.</p>
+<h3>3.4 Queue management — <code class="notranslate">/queue</code> and Ctrl+Q (state-aware)</h3>
+<p><code class="notranslate">/queue</code> currently registers as a slash command but does nothing. Wire it to manage the queued stack (Ctrl+Q items only — pending is managed via Up):</p>
+<ul>
+<li><code class="notranslate">/queue</code> (no args) → interactive TUI picker showing all queued items with: index, age, and preview. Arrow keys to select, Delete/d to cancel, e to edit, q to close.</li>
+<li><code class="notranslate">/queue list</code> → text listing.</li>
+<li><code class="notranslate">/queue cancel N</code> → cancel item by index.</li>
+<li><code class="notranslate">/queue clear</code> → cancel all queued items (does NOT touch pending or the agent).</li>
+</ul>
+<p><strong>Make Ctrl+Q state-aware (symmetric with Up).</strong> Ctrl+Q already exists as the enqueue key. Extend its behavior:</p>
+<markdown-accessiblity-table><table role="table">
+<thead>
+<tr>
+<th>Input field state</th>
+<th>Ctrl+Q action</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Non-empty</strong></td>
+<td>Enqueue the typed text as a queued item (current behavior).</td>
+</tr>
+<tr>
+<td><strong>Empty + queued stack non-empty</strong></td>
+<td>Open the <code class="notranslate">/queue</code> interactive picker.</td>
+</tr>
+<tr>
+<td><strong>Empty + queued stack empty</strong></td>
+<td>No-op or brief hint ("Queue is empty").</td>
+</tr>
+</tbody>
+</table></markdown-accessiblity-table>
+<p>This gives Up and Ctrl+Q symmetric state-aware semantics:</p>
+<ul>
+<li>Up: pending non-empty → edit pending; pending empty → history.</li>
+<li>Ctrl+Q: input non-empty → queue; input empty → manage queue.</li>
+</ul>
+<p>Both keys do "the most likely intent for the current state" and the states are mutually exclusive. Removes the need to type <code class="notranslate">/queue</code> for the common queue-management case, while keeping the slash command available for keyboard-driven users and scripts.</p>
+<h3>3.5 Status bar honesty</h3>
+<p>Current code:</p>
+<div class="highlight highlight-source-js"><pre class="notranslate"><span class="pl-s1">we</span> <span class="pl-c1">=</span> <span class="pl-v">Te</span><span class="pl-kos">.</span><span class="pl-c1">disambiguateEscapeCodes</span> ? <span class="pl-s">"ctrl+enter"</span> : <span class="pl-s">"ctrl+q"</span></pre></div>
+<p>Two problems:</p>
+<p><strong>(a) Terminal-capability detection is wrong for several common cases:</strong></p>
+<ul>
+<li>Termius reports support → hint says ctrl+enter, but ctrl+enter falls through to Enter (pending).</li>
+<li>macOS Terminal.app reports support → hint says ctrl+enter, but the OS hijacks the keystroke entirely.</li>
+</ul>
+<p><strong>(b) The hint doesn't reflect state-aware keybinds.</strong> Up, Ctrl+Q, and Esc-Esc all do different things in different states (per §3.2, §3.3, §3.4) — the user can't tell what's active right now.</p>
+<p>Proposed replacement:</p>
+<ul>
+<li><strong>Always show <code class="notranslate">ctrl+q</code> as the canonical key</strong> (works in every terminal). Optionally show <code class="notranslate">ctrl+enter</code> IN ADDITION on terminals where the app has actually received a Ctrl+Enter keystroke during this session — i.e., dynamic detection by observation, not by capability advertisement.</li>
+<li><strong>Use verbs that reflect the current state</strong>, so what the hint promises is what the key does:</li>
+</ul>
+<markdown-accessiblity-table><table role="table">
+<thead>
+<tr>
+<th>State</th>
+<th>Hint should reflect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Working, input non-empty</td>
+<td><code class="notranslate">esc-esc stop · ctrl+q queue</code></td>
+</tr>
+<tr>
+<td>Working, input empty, queued items exist</td>
+<td><code class="notranslate">esc-esc stop · ctrl+q manage queue</code></td>
+</tr>
+<tr>
+<td>Working, input empty, pending exists</td>
+<td><code class="notranslate">esc-esc stop · ↑ edit pending</code></td>
+</tr>
+<tr>
+<td>Idle, input non-empty</td>
+<td><code class="notranslate">esc-esc clear · ctrl+q queue · ↑ history</code></td>
+</tr>
+<tr>
+<td>Idle, input empty</td>
+<td><code class="notranslate">esc-esc rewind · ↑ history</code></td>
+</tr>
+</tbody>
+</table></markdown-accessiblity-table>
+<p>Hint bar real estate is limited; show at most 2–3 chips, prioritized by which keys do something useful right now and which behavior is surprising/new (e.g. <code class="notranslate">↑ edit pending</code> outranks <code class="notranslate">↑ history</code> because pending-edit is the unfamiliar mode).</p>
+<p>Add the full keybind list with terminal-compatibility notes to <code class="notranslate">/help</code> always.</p>
+<h3>3.6 Naming</h3>
+<p>Internal names (<code class="notranslate">pending</code> and <code class="notranslate">queued</code>) describe storage, not behavior. Surface-level names should describe what happens at flush time.</p>
+<p>Suggested rename (UI strings only; internal symbols can stay):</p>
+<ul>
+<li><code class="notranslate">[pending]</code> → <code class="notranslate">[batched]</code> or <code class="notranslate">[add to current]</code> (whichever fits the screen)</li>
+<li><code class="notranslate">Queued (N)</code> → <code class="notranslate">Next turns (N)</code> or <code class="notranslate">Up next (N)</code></li>
+</ul>
+<p>Open to alternatives. The principle: a user reading the label should understand what happens when the agent goes idle.</p>
+<h3>3.7 Help surface</h3>
+<p>Add a <code class="notranslate">/help queue</code> (or similar) section that explains the two modes, when to use each, the four keys (Enter, Ctrl+Q, Esc-Esc, Ctrl+C), and the <code class="notranslate">/queue</code> command. Without this, the model stays as opaque as it is today.</p>
+<h3>3.8 Inline UX hints (steal Claude Code's affordances)</h3>
+<p>Discoverability is the single biggest gap today. Two specific Claude Code patterns to copy, plus one mechanic that falls out for free:</p>
+<p><strong>Placeholder hint in the empty input field — only when surprising.</strong> Terminal users already know Up recalls history; that's universal shell behavior. Don't waste the placeholder advertising it. Show the placeholder ONLY when the new, surprising mode is available:</p>
+<ul>
+<li>Pending exists → <code class="notranslate">Press up to edit pending messages</code> (dimmed placeholder inside the input)</li>
+<li>Pending empty → no placeholder (let history-recall stay implicit, like every other shell)</li>
+</ul>
+<p>The placeholder disappears the moment the user types or presses Up.</p>
+<p><strong>Mode header above the input when browsing.</strong> When the user presses Up and lands in a recallable state, show a header strip above the input box telling them what they're looking at and where they are. Claude Code uses <code class="notranslate">── History 27/29 ──</code>. We need at least:</p>
+<ul>
+<li>Browsing history → <code class="notranslate">── History {position}/{total} ──</code></li>
+<li>Editing pending → <code class="notranslate">── Editing pending ({N} message{s}) ──</code></li>
+<li>Editing queued (if <code class="notranslate">/queue edit</code> is invoked) → <code class="notranslate">── Editing queued item {index}/{total} ──</code></li>
+</ul>
+<p>The header is self-explaining; combined with users already knowing about history, it tells them what just happened without needing a hint up front.</p>
+<p><strong>Pulling pending into the input IS the cancellation mechanic.</strong> When the user presses Up to edit pending:</p>
+<ol>
+<li>The <code class="notranslate">[pending]</code> markers disappear from the canvas/transcript — the user now owns that text again, so it's no longer pending.</li>
+<li>The text loads into the input field with the <code class="notranslate">── Editing pending (N messages) ──</code> header.</li>
+<li>From here, every normal input operation does the right thing:
+<ul>
+<li><strong>Type/edit freely</strong> → revise the text.</li>
+<li><strong>Backspace/Ctrl+U to clear the field</strong> → cancels all the (formerly) pending messages. No separate cancel action needed.</li>
+<li><strong>Delete one line</strong> → cancels just that message.</li>
+<li><strong>Enter</strong> → re-submits as pending (replaces the old pending set with the edited version).</li>
+<li><strong>Ctrl+Q</strong> → submits as queued items instead (one per delimiter line).</li>
+<li><strong>Esc</strong> → discards the edit and restores the original pending set to the canvas.</li>
+</ul>
+</li>
+</ol>
+<p>No separate "cancel pending" command is needed because Up→clear is already the natural sequence. The mental model is: pending lives on the canvas only as long as you haven't reached up to grab it back.</p>
+<p><strong>Edge case — agent finishes while user is editing pending.</strong> The agent has nothing to flush (pending is now in the input field, not in <code class="notranslate">itemQueue</code>). The agent just goes idle. If the user hits Enter while editing, it sends as a normal idle-mode user turn. Clean — no special-case logic needed.</p>
+<p><strong>Status bar working-state hint</strong> — covered in §3.5. The placeholder hint and mode header above only handle the in-input affordances; the status bar at the bottom is the always-on contract about what keys do right now.</p>
+<h2>4. Out of scope (file separately, don't expand this design)</h2>
+<ul>
+<li>Persistence across crash/restart (issue #1437) — orthogonal, can layer on top.</li>
+<li>The phantom "Operation cancelled by user" transcript line (partially fixed in #3826; separate cleanup pass).</li>
+<li>System notifications interleaving with the queue (issue #3517) — separate ordering problem.</li>
+<li>The Esc-Esc-with-empty-queue → rewind escape hatch (works as documented, leave alone).</li>
+<li>Plugin/marketplace management UX (separate issues #3917, #3918).</li>
+</ul>
+<h2>5. Migration / compatibility</h2>
+<ul>
+<li>The submission modes don't change underneath. <code class="notranslate">itemQueue</code> and <code class="notranslate">processQueuedItems</code> stay as-is.</li>
+<li>Esc-Esc behavior change is the only user-visible regression: users who relied on Esc-Esc to peel pending will need to learn Up→edit→delete-line instead. Worth a one-time <code class="notranslate">/release-notes</code>-style callout on first run after upgrade.</li>
+<li><code class="notranslate">/queue</code> going from no-op to interactive is purely additive.</li>
+<li>Status bar string changes — visible but trivial.</li>
+</ul>
+<h2>6. Open questions</h2>
+<ol>
+<li><strong>Should Up-arrow's load-pending behavior cycle?</strong> E.g. press Up once → load pending; press Up again → recall history. Or should it be modal (only one behavior per state)? Lean toward modal — pending exists OR history is loaded, never both at the input.</li>
+<li><strong>The inter-queued-item pause</strong> — is 500ms the right number, or should it be configurable? Maybe just ship a sensible default and add a <code class="notranslate">pauseBetweenQueued</code> setting if anyone complains.</li>
+<li><strong>Naming</strong> — <code class="notranslate">[batched]</code> / <code class="notranslate">Next turns (N)</code> is one suggestion; better names welcome.</li>
+<li><strong><code class="notranslate">/queue</code> keybind</strong> — worth adding Ctrl+L (or similar) for direct invocation, or is the slash command enough?</li>
+</ol>
+<h2>7. References</h2>
+<ul>
+<li>Research: <code class="notranslate">queue-esc-report.md</code> (this folder).</li>
+<li>Source analysis: <code class="notranslate">queue-esc-report.md §3a</code> (extracted from app.js v1.0.65).</li>
+<li>Cross-terminal evidence: <code class="notranslate">queue-esc-report.md §3a</code> (verified Termius + Terminal.app).</li>
+<li>Claude Code comparison: <code class="notranslate">queue-esc-report.md §4a</code>.</li>
+<li>Related copilot-cli issues: see <code class="notranslate">queue-esc-report.md §8</code> for full inventory.</li>
+</ul>
+</article>
+</body>
+</html>
